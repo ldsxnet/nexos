@@ -574,47 +574,163 @@ async def chat_completions(request: Request, payload: Optional[Dict[str, Any]] =
     async with httpx.AsyncClient() as client:
         last_message_id = None if disable_history else await fetch_last_message_id(chat_id, cookie, client)
 
-        nexos_data: Dict[str, Any] = {
-            "handler": {"id": handler_id, "type": "model", "fallbacks": True},
-            "user_message": {
-                "text": user_message,
-                "client_metadata": {},
-                "files": [],
+    nexos_data: Dict[str, Any] = {
+        "handler": {"id": handler_id, "type": "model", "fallbacks": True},
+        "user_message": {
+            "text": user_message,
+            "client_metadata": {},
+            "files": [],
+        },
+        "advanced_parameters": {},
+        "functionalityHeader": "chat",
+        "tools": {
+            "web_search": {"enabled": False},
+            "deep_research": {"enabled": False},
+            "code_interpreter": {"enabled": True},
+        },
+        "enabled_integrations": [],
+        "chat": {},
+    }
+
+    if isinstance(adjusted_max_tokens, int):
+        nexos_data["advanced_parameters"]["max_completion_tokens"] = adjusted_max_tokens
+
+    if isinstance(temperature, (int, float)) and temperature != 1:
+        nexos_data["advanced_parameters"]["temperature"] = temperature
+
+    if isinstance(last_message_id, str) and last_message_id:
+        nexos_data["chat"]["last_message_id"] = last_message_id
+
+    nexos_files = {
+        "action": (None, json.dumps("chat_completion", ensure_ascii=False)),
+        "chatId": (None, json.dumps(chat_id, ensure_ascii=False)),
+        "data": (None, json.dumps(nexos_data, ensure_ascii=False)),
+    }
+    nexos_headers = {
+        **make_common_headers(cookie, f"{BASE_URL}/chat/{chat_id}"),
+        "origin": BASE_URL,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+    }
+
+    if stream:
+        async def event_gen() -> Any:
+            stream_id = f"chatcmpl-{uuid.uuid4()}"
+            created_ts = int(time.time())
+            host_for_stream = get_server_host(request)
+            file_mapping: Dict[str, str] = {}
+
+            async with httpx.AsyncClient() as stream_client:
+                async with stream_client.stream(
+                    "POST",
+                    f"{BASE_URL}/api/chat/{chat_id}",
+                    files=nexos_files,
+                    headers=nexos_headers,
+                    timeout=REQUEST_TIMEOUT,
+                ) as upstream_resp:
+                    if upstream_resp.status_code != 200:
+                        error_body = await upstream_resp.aread()
+                        error_chunk = {
+                            "error": {
+                                "message": f"Nexos API returned {upstream_resp.status_code}",
+                                "body": error_body.decode("utf-8", errors="ignore"),
+                            }
+                        }
+                        yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    async for line in upstream_resp.aiter_lines():
+                        if not line or not line.startswith("data: "):
+                            continue
+                        if "[DONE]" in line:
+                            break
+
+                        raw_payload = line[6:].strip()
+                        if not raw_payload:
+                            continue
+
+                        try:
+                            data = json.loads(raw_payload)
+                        except Exception:
+                            continue
+
+                        tool_result = data.get("tool_result") if isinstance(data, dict) else None
+                        if isinstance(tool_result, dict):
+                            result_obj = tool_result.get("result")
+                            if isinstance(result_obj, dict):
+                                results = result_obj.get("results")
+                                if isinstance(results, list):
+                                    for item in results:
+                                        if not isinstance(item, dict):
+                                            continue
+                                        files_obj = item.get("files")
+                                        if not isinstance(files_obj, dict):
+                                            continue
+                                        files = files_obj.get("files")
+                                        if not isinstance(files, list):
+                                            continue
+                                        for file_item in files:
+                                            if not isinstance(file_item, dict):
+                                                continue
+                                            name = file_item.get("name")
+                                            file_uuid = file_item.get("file_uuid")
+                                            if isinstance(name, str) and isinstance(file_uuid, str):
+                                                file_mapping[name] = file_uuid
+
+                        content_type = data.get("content_type") if isinstance(data, dict) else None
+                        content_obj = data.get("content") if isinstance(data, dict) else None
+                        if content_type == "text" and isinstance(content_obj, dict):
+                            text_piece = content_obj.get("text")
+                            if isinstance(text_piece, str) and text_piece:
+                                text_piece = replace_sandbox_links(text_piece, file_mapping, chat_id, host_for_stream)
+                                text_piece = replace_direct_file_links(text_piece, host_for_stream)
+                                chunk = {
+                                    "id": stream_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created_ts,
+                                    "model": canonical_model_name(model_name),
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {"content": text_piece},
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+            end_chunk = {
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": created_ts,
+                "model": canonical_model_name(model_name),
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            event_gen(),
+            media_type="text/event-stream",
+            headers={
+                "cache-control": "no-cache",
+                "x-accel-buffering": "no",
             },
-            "advanced_parameters": {},
-            "functionalityHeader": "chat",
-            "tools": {
-                "web_search": {"enabled": False},
-                "deep_research": {"enabled": False},
-                "code_interpreter": {"enabled": True},
-            },
-            "enabled_integrations": [],
-            "chat": {},
-        }
+        )
 
-        if isinstance(adjusted_max_tokens, int):
-            nexos_data["advanced_parameters"]["max_completion_tokens"] = adjusted_max_tokens
-
-        if isinstance(temperature, (int, float)) and temperature != 1:
-            nexos_data["advanced_parameters"]["temperature"] = temperature
-
-        if isinstance(last_message_id, str) and last_message_id:
-            nexos_data["chat"]["last_message_id"] = last_message_id
-
+    async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{BASE_URL}/api/chat/{chat_id}",
-            files={
-                "action": (None, json.dumps("chat_completion", ensure_ascii=False)),
-                "chatId": (None, json.dumps(chat_id, ensure_ascii=False)),
-                "data": (None, json.dumps(nexos_data, ensure_ascii=False)),
-            },
-            headers={
-                **make_common_headers(cookie, f"{BASE_URL}/chat/{chat_id}"),
-                "origin": BASE_URL,
-                "sec-fetch-dest": "empty",
-                "sec-fetch-mode": "cors",
-                "sec-fetch-site": "same-origin",
-            },
+            files=nexos_files,
+            headers=nexos_headers,
             timeout=REQUEST_TIMEOUT,
         )
 
@@ -629,26 +745,6 @@ async def chat_completions(request: Request, payload: Optional[Dict[str, Any]] =
 
     host = get_server_host(request)
     content_text = parse_nexos_sse_payload(resp.text, chat_id, host)
-
-    if stream:
-        async def event_gen() -> Any:
-            chunk = {
-                "id": f"chatcmpl-{uuid.uuid4()}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": canonical_model_name(model_name),
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": content_text},
-                        "finish_reason": None,
-                    }
-                ],
-            }
-            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(event_gen(), media_type="text/event-stream")
 
     response_payload = {
         "id": f"chatcmpl-{uuid.uuid4()}",
