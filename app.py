@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 try:
@@ -24,6 +25,7 @@ ACCOUNTS_FILE = Path(os.getenv("NEXOS_ACCOUNTS_FILE", "./nexos_accounts.json"))
 CURRENT_CHAT_FILE = Path(os.getenv("CURRENT_CHAT_FILE", "./current-chat.json"))
 DISABLE_HISTORY_DEFAULT = os.getenv("DISABLE_HISTORY", "false").lower() == "true"
 REQUEST_TIMEOUT = float(os.getenv("NEXOS_TIMEOUT", "120"))
+PASSWORD = os.getenv("PASSWORD", "")
 
 DEFAULT_CREATED_TS = 1677610602
 DEFAULT_USER_AGENT = (
@@ -32,6 +34,13 @@ DEFAULT_USER_AGENT = (
 )
 
 app = FastAPI(title="Nexos OpenAI Proxy (FastAPI)")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def read_json_file(path: Path, default_value: Any) -> Any:
@@ -417,7 +426,12 @@ def get_server_host(request: Request) -> str:
 
 
 @app.get("/v1/models")
-async def list_models() -> Dict[str, Any]:
+async def list_models(request: Request) -> Dict[str, Any]:
+    if PASSWORD:
+        token = request.headers.get("authorization", "").removeprefix("Bearer ")
+        if not token or token != PASSWORD:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
     accounts = load_accounts()
     return {"object": "list", "data": build_models(accounts)}
 
@@ -450,6 +464,11 @@ async def download_file(chat_id: str, file_id: str, request: Request) -> Respons
 
 @app.post("/v1/chat/create")
 async def create_chat(request: Request, payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
+    if PASSWORD:
+        token = request.headers.get("authorization", "").removeprefix("Bearer ")
+        if not token or token != PASSWORD:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
     payload = payload or {}
     accounts = load_accounts()
     account, account_index = resolve_account(request, payload, accounts)
@@ -477,6 +496,11 @@ async def create_chat(request: Request, payload: Optional[Dict[str, Any]] = Body
 
 @app.post("/v1/chat/switch")
 async def switch_chat(request: Request, payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
+    if PASSWORD:
+        token = request.headers.get("authorization", "").removeprefix("Bearer ")
+        if not token or token != PASSWORD:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
     payload = payload or {}
     chat_id = payload.get("chatId")
     if not isinstance(chat_id, str) or not chat_id.strip():
@@ -495,6 +519,11 @@ async def switch_chat(request: Request, payload: Optional[Dict[str, Any]] = Body
 
 @app.get("/v1/chat/current")
 async def current_chat(request: Request) -> Dict[str, Any]:
+    if PASSWORD:
+        token = request.headers.get("authorization", "").removeprefix("Bearer ")
+        if not token or token != PASSWORD:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
     accounts = load_accounts()
     account, account_index = resolve_account(request, {}, accounts)
     chat_id = get_current_chat_id_for_account(account, account_index)
@@ -507,6 +536,11 @@ async def current_chat(request: Request) -> Dict[str, Any]:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, payload: Optional[Dict[str, Any]] = Body(default=None)) -> Response:
+    if PASSWORD:
+        token = request.headers.get("authorization", "").removeprefix("Bearer ")
+        if not token or token != PASSWORD:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
     payload = payload or {}
 
     accounts = load_accounts()
