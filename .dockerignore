@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.log
+.DS_Store
+node_modules
+current-chat.json
+nexos_accounts.json
+README.md
+.github
+.agents
+.agent

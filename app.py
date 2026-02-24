@@ -10,6 +10,8 @@ import httpx
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+import threading
 
 try:
     from dotenv import load_dotenv
@@ -52,11 +54,51 @@ def read_json_file(path: Path, default_value: Any) -> Any:
         return default_value
 
 
+_accounts_cache = {
+    "mtime": 0.0,
+    "data": None,
+    "lock": threading.Lock(),
+}
+
+
 def load_accounts() -> List[Dict[str, Any]]:
-    accounts = read_json_file(ACCOUNTS_FILE, [])
-    if not isinstance(accounts, list) or not accounts:
-        raise HTTPException(status_code=500, detail=f"Invalid or empty accounts file: {ACCOUNTS_FILE}")
-    return accounts
+    env_accounts = os.getenv("NEXOS_ACCOUNTS", "").strip()
+
+    with _accounts_cache["lock"]:
+        try:
+            current_mtime = ACCOUNTS_FILE.stat().st_mtime
+        except FileNotFoundError:
+            current_mtime = 0.0
+
+        if _accounts_cache["data"] is not None and _accounts_cache["mtime"] == current_mtime:
+            return _accounts_cache["data"]
+
+        accounts = []
+        if current_mtime > 0:
+            accounts = read_json_file(ACCOUNTS_FILE, [])
+        elif env_accounts:
+            try:
+                accounts = json.loads(env_accounts)
+            except Exception:
+                pass
+
+        if not isinstance(accounts, list) or not accounts:
+            raise HTTPException(status_code=500, detail=f"Invalid or empty accounts configuration. Check file ({ACCOUNTS_FILE}) or NEXOS_ACCOUNTS env var.")
+
+        _accounts_cache["mtime"] = current_mtime
+        _accounts_cache["data"] = accounts
+        return accounts
+
+
+def save_accounts(accounts: List[Dict[str, Any]]) -> None:
+    try:
+        ACCOUNTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ACCOUNTS_FILE.write_text(json.dumps(accounts, ensure_ascii=False, indent=2), encoding="utf-8")
+        with _accounts_cache["lock"]:
+            _accounts_cache["mtime"] = ACCOUNTS_FILE.stat().st_mtime
+            _accounts_cache["data"] = accounts
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save accounts update: {str(e)}")
 
 
 def sanitize_cookie(cookie: str) -> str:
@@ -259,30 +301,57 @@ async def fetch_last_message_id(chat_id: str, cookie: str, client: httpx.AsyncCl
     return None
 
 
-def extract_last_user_text(messages: Any) -> str:
+def _extract_message_text(msg: Dict[str, Any]) -> str:
+    """Extract text content from a single message object."""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        return "\n".join(parts)
+    return ""
+
+
+def build_full_prompt(messages: Any) -> str:
+    """Concatenate all messages into a single prompt so Nexos receives full context.
+
+    If the messages list contains only a single user message (no system prompt,
+    no history), the raw text is returned as-is to avoid unnecessary decoration.
+    Otherwise each message is prefixed with a role label.
+    """
     if not isinstance(messages, list):
         raise HTTPException(status_code=400, detail="messages must be an array")
 
-    for msg in reversed(messages):
+    # Fast path: single user message → return raw text (no role labels needed)
+    if len(messages) == 1 and isinstance(messages[0], dict) and messages[0].get("role") == "user":
+        text = _extract_message_text(messages[0]).strip()
+        if text:
+            return text
+
+    role_labels: Dict[str, str] = {
+        "system": "[System]",
+        "user": "[User]",
+        "assistant": "[Assistant]",
+    }
+
+    sections: List[str] = []
+    for msg in messages:
         if not isinstance(msg, dict):
             continue
-        if msg.get("role") != "user":
+        role = msg.get("role", "")
+        text = _extract_message_text(msg).strip()
+        if not text:
             continue
+        label = role_labels.get(role, f"[{role}]")
+        sections.append(f"{label}\n{text}")
 
-        content = msg.get("content")
-        if isinstance(content, str) and content.strip():
-            return content
+    if not sections:
+        raise HTTPException(status_code=400, detail="No message content found")
 
-        if isinstance(content, list):
-            parts: List[str] = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
-                    parts.append(part["text"])
-            joined = "\n".join(parts).strip()
-            if joined:
-                return joined
-
-    raise HTTPException(status_code=400, detail="No user message found")
+    return "\n\n".join(sections)
 
 
 def replace_direct_file_links(text: str, server_host: str) -> str:
@@ -425,6 +494,29 @@ def get_server_host(request: Request) -> str:
     return f"{HOST}:{PORT}"
 
 
+@app.get("/v1/accounts")
+async def get_accounts(request: Request) -> Response:
+    if PASSWORD:
+        token = request.headers.get("authorization", "").removeprefix("Bearer ")
+        if not token or token != PASSWORD:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+    return JSONResponse(content=load_accounts())
+
+
+@app.put("/v1/accounts")
+async def update_accounts(request: Request, payload: Any = Body(...)) -> Dict[str, Any]:
+    if PASSWORD:
+        token = request.headers.get("authorization", "").removeprefix("Bearer ")
+        if not token or token != PASSWORD:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if not isinstance(payload, list):
+        raise HTTPException(status_code=400, detail="Payload must be a JSON array of accounts")
+
+    save_accounts(payload)
+    return {"success": True, "message": "Accounts updated and saved successfully"}
+
+
 @app.get("/v1/models")
 async def list_models(request: Request) -> Dict[str, Any]:
     if PASSWORD:
@@ -434,7 +526,6 @@ async def list_models(request: Request) -> Dict[str, Any]:
 
     accounts = load_accounts()
     return {"object": "list", "data": build_models(accounts)}
-
 
 @app.get("/v1/files/{chat_id}/{file_id}/download")
 async def download_file(chat_id: str, file_id: str, request: Request) -> Response:
@@ -548,7 +639,7 @@ async def chat_completions(request: Request, payload: Optional[Dict[str, Any]] =
     cookie = get_cookie_from_account(account)
 
     messages = payload.get("messages")
-    user_message = extract_last_user_text(messages)
+    user_message = build_full_prompt(messages)
 
     model_name = str(payload.get("model") or "nexos-chat")
     handler_id = choose_handler_id(account, model_name)
@@ -771,6 +862,12 @@ async def chat_completions(request: Request, payload: Optional[Dict[str, Any]] =
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+
+# Frontend dashboard mounting for accounts management
+static_dir = Path(__file__).parent / "static"
+if static_dir.exists():
+    app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
+
 
 
 if __name__ == "__main__":
